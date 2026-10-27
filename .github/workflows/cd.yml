@@ -1,0 +1,94 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint and test
+        run: |
+          ruff check .
+          pytest
+
+      - name: Train model
+        run: python -m src.train
+
+      - name: Quality gate
+        run: python -m src.evaluate
+
+      - name: Docker metadata (tags and labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build image (loaded locally for smoke test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ml-cicd-demo:smoke
+
+      - name: Smoke test the container
+        run: |
+          docker run -d --name smoke -p 8000:8000 ml-cicd-demo:smoke
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:8000/health > /dev/null; then break; fi
+            sleep 2
+          done
+          curl -sf http://localhost:8000/health | grep '"model_loaded":true'
+          curl -sf http://localhost:8000/model-info > /dev/null
+          docker logs smoke
+          docker rm -f smoke
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # Deployment is left as a clearly marked hook: replace the echo with your
+  # real target (SSH + docker pull, kubectl set image, a cloud run deploy, ...).
+  deploy:
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    environment: production   # configure required reviewers in repo Settings > Environments
+    steps:
+      - name: Deploy
+        run: |
+          echo "Deploy ${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7} to production here"
